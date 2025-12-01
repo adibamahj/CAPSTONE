@@ -14,8 +14,9 @@ from pytector import PromptInjectionDetector
 from datetime import datetime
 import sounddevice as sd
 import queue
-from vosk import Model, KaldiRecognizer
-import threading
+import numpy as np
+import whisper
+import wave
 
 # Configuration Paths
 API_KEY = os.getenv("TAMUS_AI_CHAT_API_KEY")
@@ -25,16 +26,16 @@ INDEX_PATH = "index/vector_index.pkl"
 MODEL_NAME = "all-MiniLM-L6-v2"
 FAQS_PATH = "faqs.json"
 INAPPROPRIATE_LOG = "inappropriate_queries.txt"
-VOSK_MODEL_PATH = "vosk-model-en-us-0.22-lgraph"
+WHISPER_MODEL = "base"  # Options: tiny, base, small, medium, large
 
-# Speech to text Vosk Model
+# Whisper Model Loading
 @st.cache_resource
-def load_vosk_model():
-    """Load Vosk model once and cache it."""
+def load_whisper_model():
+    """Load Whisper model once and cache it."""
     try:
-        return Model(VOSK_MODEL_PATH)
+        return whisper.load_model(WHISPER_MODEL)
     except Exception as e:
-        st.error(f"Failed to load Vosk model from {VOSK_MODEL_PATH}: {e}")
+        st.error(f"Failed to load Whisper model: {e}")
         return None
 
 #UI CSS
@@ -160,54 +161,40 @@ def speak_text(text):
                 st.audio(fp.name, format="audio/mp3")
         asyncio.run(_speak())
 
-# VOSK STT Function - updated model to 1.8 GB eek
-def transcribe_with_vosk(duration=10):
+# Whisper STT Function - MUCH BETTER ACCURACY
+def transcribe_with_whisper(duration=5):
     """
-    Record audio for specified duration and transcribe using Vosk.
+    Record audio for specified duration and transcribe using Whisper AI.
     Returns transcribed text.
-    IMPROVED: Better sample rate, larger model recommended, longer duration
+    Whisper provides much better accuracy than Vosk, especially for technical terms.
     """
-    vosk_model = load_vosk_model()
-    if vosk_model is None:
-        raise RuntimeError("Vosk model not loaded")
+    whisper_model = load_whisper_model()
+    if whisper_model is None:
+        raise RuntimeError("Whisper model not loaded")
     
-    # Use 16000 Hz for better accuracy (Vosk's recommended rate)
-    recognizer = KaldiRecognizer(vosk_model, 16000)
-    recognizer.SetMaxAlternatives(0)  # Only best result
-    recognizer.SetWords(True)  # Enable word-level timestamps for better accuracy
-    
-    audio_q = queue.Queue()
-    transcribed_text = []
+    # Record audio
+    sample_rate = 16000
+    audio_data = []
     
     def callback(indata, frames, time, status):
         if status:
             print("Audio status:", status)
-        audio_q.put(bytes(indata))
+        audio_data.append(indata.copy())
     
-    # Record for specified duration with optimized settings
-    with sd.RawInputStream(samplerate=16000, blocksize=2000, dtype="int16",
-                           channels=1, callback=callback):
+    # Record audio
+    with sd.InputStream(samplerate=sample_rate, channels=1, dtype='float32', callback=callback):
         import time
-        start_time = time.time()
-        
-        while time.time() - start_time < duration:
-            try:
-                data = audio_q.get(timeout=0.1)
-                if recognizer.AcceptWaveform(data):
-                    result = json.loads(recognizer.Result())
-                    text = result.get("text", "")
-                    if text.strip():
-                        transcribed_text.append(text.strip())
-            except queue.Empty:
-                continue
-        
-        # Get final result
-        final_result = json.loads(recognizer.FinalResult())
-        final_text = final_result.get("text", "")
-        if final_text.strip():
-            transcribed_text.append(final_text.strip())
+        time.sleep(duration)
     
-    return " ".join(transcribed_text)
+    # Convert to numpy array
+    audio_np = np.concatenate(audio_data, axis=0).flatten()
+    
+    # Transcribe using Whisper
+    result = whisper_model.transcribe(audio_np, fp16=False)
+    transcribed_text = result["text"].strip()
+    
+    print(f"Whisper transcribed: {transcribed_text}")  # Debug output
+    return transcribed_text
 
 # Local FAQ Fuzzy match
 def match_faq_local(user_input, embed_model, faqs, threshold=0.78):
@@ -361,7 +348,7 @@ def admin_dashboard_page(faqs):
 # Chatbot UI Page - IMPROVED
 def chatbot_page(index, texts, embed_model, faqs):
     st.title("ECEN Chatbot")
-    st.write("Ask lab-related or course questions by typing or speaking (powered by Vosk offline STT).")
+    st.write("Ask lab-related or course questions by typing or speaking (powered by Whisper AI for superior accuracy).")
 
     # Sidebar FAQ quick pick
     with st.sidebar:
@@ -372,7 +359,7 @@ def chatbot_page(index, texts, embed_model, faqs):
                     if st.button(qa["question"], key=f"faq_{qa['question']}"):
                         st.session_state["prefilled_question"] = qa["question"]
                         st.session_state["prefilled_answer"] = qa["answer"]
-                        st.rerun()
+                        # Don't rerun here - let the page render naturally
 
     # Initialize STT result storage
     if "stt_result" not in st.session_state:
@@ -384,9 +371,9 @@ def chatbot_page(index, texts, embed_model, faqs):
 
     with col2:
         if st.button("🎤 Speak"):
-            with st.spinner("🎙️ Listening for 7 seconds... Speak clearly near your microphone"):
+            with st.spinner("🎙️ Listening for 5 seconds... Speak naturally"):
                 try:
-                    transcribed = transcribe_with_vosk(duration=7)
+                    transcribed = transcribe_with_whisper(duration=5)
                     if transcribed:
                         st.session_state["stt_result"] = transcribed
                         # Clear any prefilled FAQ data
@@ -395,7 +382,7 @@ def chatbot_page(index, texts, embed_model, faqs):
                         st.success(f"✅ You said: {transcribed}")
                         st.rerun()
                     else:
-                        st.warning("⚠️ No speech detected. Please try again and speak louder.")
+                        st.warning("⚠️ No speech detected. Please try again.")
                 except Exception as e:
                     st.error(f"STT error: {e}")
 
@@ -408,12 +395,16 @@ def chatbot_page(index, texts, embed_model, faqs):
     if "prefilled_answer" in st.session_state and default_q and not st.session_state.get("stt_result"):
         st.subheader("💬 FAQ Answer")
         st.write(st.session_state["prefilled_answer"])
-        if st.button("Play FAQ answer"):
-            speak_text(st.session_state["prefilled_answer"])
-        if st.button("Clear FAQ"):
-            st.session_state.pop("prefilled_question", None)
-            st.session_state.pop("prefilled_answer", None)
-            st.rerun()
+        
+        col_play, col_clear = st.columns([1, 1])
+        with col_play:
+            if st.button("🔊 Play FAQ answer"):
+                speak_text(st.session_state["prefilled_answer"])
+        with col_clear:
+            if st.button("🗑️ Clear FAQ"):
+                st.session_state.pop("prefilled_question", None)
+                st.session_state.pop("prefilled_answer", None)
+                st.rerun()
         return
 
     if user_input:
