@@ -25,7 +25,7 @@ INDEX_PATH = "index/vector_index.pkl"
 MODEL_NAME = "all-MiniLM-L6-v2"
 FAQS_PATH = "faqs.json"
 INAPPROPRIATE_LOG = "inappropriate_queries.txt"
-VOSK_MODEL_PATH = "vosk-model-small-en-us-0.15"
+VOSK_MODEL_PATH = "vosk-model-en-us-0.22-lgraph"
 
 # Speech to text Vosk Model
 @st.cache_resource
@@ -160,17 +160,22 @@ def speak_text(text):
                 st.audio(fp.name, format="audio/mp3")
         asyncio.run(_speak())
 
-# VOSK STT Function
-def transcribe_with_vosk(duration=5):
+# VOSK STT Function - updated model to 1.8 GB eek
+def transcribe_with_vosk(duration=10):
     """
     Record audio for specified duration and transcribe using Vosk.
     Returns transcribed text.
+    IMPROVED: Better sample rate, larger model recommended, longer duration
     """
     vosk_model = load_vosk_model()
     if vosk_model is None:
         raise RuntimeError("Vosk model not loaded")
     
+    # Use 16000 Hz for better accuracy (Vosk's recommended rate)
     recognizer = KaldiRecognizer(vosk_model, 16000)
+    recognizer.SetMaxAlternatives(0)  # Only best result
+    recognizer.SetWords(True)  # Enable word-level timestamps for better accuracy
+    
     audio_q = queue.Queue()
     transcribed_text = []
     
@@ -179,8 +184,8 @@ def transcribe_with_vosk(duration=5):
             print("Audio status:", status)
         audio_q.put(bytes(indata))
     
-    # Record for specified duration
-    with sd.RawInputStream(samplerate=16000, blocksize=8000, dtype="int16",
+    # Record for specified duration with optimized settings
+    with sd.RawInputStream(samplerate=16000, blocksize=2000, dtype="int16",
                            channels=1, callback=callback):
         import time
         start_time = time.time()
@@ -239,7 +244,6 @@ def admin_login_page():
             st.session_state["admin_logged_in"] = True
             st.session_state["page"] = "Admin Dashboard"
             st.success("Login successful! Redirecting to dashboard...")
-            # Use rerun without any delay
             st.rerun()
         else:
             st.error("Invalid credentials")
@@ -354,7 +358,7 @@ def admin_dashboard_page(faqs):
             else:
                 st.info("No questions to delete in this category.")
 
-# Chatbot UI Page
+# Chatbot UI Page - IMPROVED
 def chatbot_page(index, texts, embed_model, faqs):
     st.title("ECEN Chatbot")
     st.write("Ask lab-related or course questions by typing or speaking (powered by Vosk offline STT).")
@@ -368,42 +372,55 @@ def chatbot_page(index, texts, embed_model, faqs):
                     if st.button(qa["question"], key=f"faq_{qa['question']}"):
                         st.session_state["prefilled_question"] = qa["question"]
                         st.session_state["prefilled_answer"] = qa["answer"]
+                        st.rerun()
+
+    # Initialize STT result storage
+    if "stt_result" not in st.session_state:
+        st.session_state["stt_result"] = ""
 
     default_q = st.session_state.get("prefilled_question", "")
     
     col1, col2 = st.columns([4, 1])
 
-    with col1:
-        user_input = st.text_input("Type your question here:", value=default_q, key="user_input")
-
     with col2:
         if st.button("🎤 Speak"):
-            with st.spinner("🎙️ Listening for 5 seconds..."):
+            with st.spinner("🎙️ Listening for 7 seconds... Speak clearly near your microphone"):
                 try:
-                    user_input = transcribe_with_vosk(duration=5)
-                    st.session_state["stt_result"] = user_input
-                    if user_input:
-                        st.success(f"You said: {user_input}")
+                    transcribed = transcribe_with_vosk(duration=7)
+                    if transcribed:
+                        st.session_state["stt_result"] = transcribed
+                        # Clear any prefilled FAQ data
+                        st.session_state.pop("prefilled_question", None)
+                        st.session_state.pop("prefilled_answer", None)
+                        st.success(f"✅ You said: {transcribed}")
                         st.rerun()
                     else:
-                        st.warning("No speech detected. Please try again.")
+                        st.warning("⚠️ No speech detected. Please try again and speak louder.")
                 except Exception as e:
                     st.error(f"STT error: {e}")
 
-    # Use STT result if available
-    if "stt_result" in st.session_state and not user_input:
-        user_input = st.session_state["stt_result"]
-        st.session_state.pop("stt_result", None)
+    with col1:
+        # Use STT result if available, otherwise use default
+        current_input = st.session_state.get("stt_result", default_q)
+        user_input = st.text_input("Type your question here:", value=current_input, key="user_input")
 
     # Auto-display prefilled FAQ answer
-    if "prefilled_answer" in st.session_state and default_q:
+    if "prefilled_answer" in st.session_state and default_q and not st.session_state.get("stt_result"):
         st.subheader("💬 FAQ Answer")
         st.write(st.session_state["prefilled_answer"])
         if st.button("Play FAQ answer"):
             speak_text(st.session_state["prefilled_answer"])
+        if st.button("Clear FAQ"):
+            st.session_state.pop("prefilled_question", None)
+            st.session_state.pop("prefilled_answer", None)
+            st.rerun()
         return
 
     if user_input:
+        # Clear STT result now that we're processing
+        if "stt_result" in st.session_state:
+            st.session_state["stt_result"] = ""
+            
         # input safety
         is_injection, _ = detector.detect_injection(user_input)
         blocked, keywords = detector.check_input_keywords(user_input)
@@ -427,7 +444,8 @@ def chatbot_page(index, texts, embed_model, faqs):
         prompt = f"Context:\n{context}\n\nQuestion: {user_input}\nAnswer clearly and concisely."
 
         try:
-            answer = query_tamuai(prompt)
+            with st.spinner("🤔 Thinking..."):
+                answer = query_tamuai(prompt)
         except Exception as e:
             st.error(f"LLM request failed: {e}")
             return
