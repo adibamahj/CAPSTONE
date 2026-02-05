@@ -1,4 +1,4 @@
-# rag_ui.py - UPDATED WITH ESP32 INTEGRATION
+# rag_ui.py
 import os
 import io
 import json
@@ -156,7 +156,7 @@ def query_tamuai(prompt):
     r.raise_for_status()
     return r.json()["choices"][0]["message"]["content"]
 
-# Text to Speech
+# Text to Speech - Offline-capable with pyttsx3 fallback
 def speak_text(text):
     """Generate TTS audio with offline support."""
     if TTS_ENGINE == "gtts":
@@ -166,140 +166,294 @@ def speak_text(text):
             with tempfile.NamedTemporaryFile(delete=False, suffix=".mp3") as fp:
                 audio_file = fp.name
                 tts.save(audio_file)
+                
+                # Method 1: Streamlit audio player (works in browser)
                 st.audio(audio_file, format="audio/mp3", autoplay=True)
+                
+                # Method 2: Try system playback as backup
+                try:
+                    import subprocess
+                    players = [
+                        ['mpg123', audio_file],
+                        ['ffplay', '-nodisp', '-autoexit', audio_file],
+                        ['paplay', audio_file],
+                    ]
+                    
+                    for player_cmd in players:
+                        try:
+                            subprocess.Popen(player_cmd, 
+                                           stdout=subprocess.DEVNULL, 
+                                           stderr=subprocess.DEVNULL)
+                            break
+                        except FileNotFoundError:
+                            continue
+                except Exception as e:
+                    print(f"System audio playback failed: {e}")
         except Exception as e:
-            st.warning(f"gTTS failed: {e}")
+            st.warning(f"gTTS failed (maybe offline?): {e}. Trying offline TTS...")
+            speak_text_offline(text)
+            
+    elif TTS_ENGINE == "pyttsx3":
+        speak_text_offline(text)
+        
+    elif TTS_ENGINE == "edge_tts":
+        import edge_tts
+        import asyncio
+        async def _speak():
+            communicate = edge_tts.Communicate(text, "en-US-JennyNeural")
+            with tempfile.NamedTemporaryFile(delete=False, suffix=".mp3") as fp:
+                await communicate.save(fp.name)
+                st.audio(fp.name, format="audio/mp3", autoplay=True)
+        asyncio.run(_speak())
 
-# Voice Recording with Whisper
+def speak_text_offline(text):
+    """Offline TTS using pyttsx3 - works without internet."""
+    try:
+        import pyttsx3
+        engine = pyttsx3.init()
+        
+        # Configure voice properties
+        engine.setProperty('rate', 150)  # Speed of speech
+        engine.setProperty('volume', 0.9)  # Volume (0.0 to 1.0)
+        
+        # Save to file for Streamlit playback
+        with tempfile.NamedTemporaryFile(delete=False, suffix=".wav") as fp:
+            audio_file = fp.name
+            engine.save_to_file(text, audio_file)
+            engine.runAndWait()
+            
+            # Display in Streamlit
+            st.audio(audio_file, format="audio/wav", autoplay=True)
+            st.success("Playing audio (offline mode)")
+    except Exception as e:
+        st.error(f"Offline TTS failed: {e}. Please install pyttsx3: pip install pyttsx3")
+
+# Whisper STT Function - Optimized for Jetson
 def transcribe_with_whisper(duration=5):
-    """Record and transcribe audio using Whisper."""
-    model = load_whisper_model()
-    if not model:
-        return None
+    """
+    Record audio for specified duration and transcribe using Whisper AI.
+    Returns transcribed text.
+    Optimized for Jetson with FP16 support for faster inference.
+    """
+    whisper_model = load_whisper_model()
+    if whisper_model is None:
+        raise RuntimeError("Whisper model not loaded")
     
-    SAMPLE_RATE = 16000
-    print(f"Recording for {duration} seconds...")
-    audio_data = sd.rec(int(duration * SAMPLE_RATE), samplerate=SAMPLE_RATE, channels=1, dtype='float32')
-    sd.wait()
+    # Record audio
+    sample_rate = 16000
+    audio_data = []
     
-    audio_data = audio_data.flatten()
-    result = model.transcribe(audio_data, fp16=False)
-    return result["text"].strip()
+    def callback(indata, frames, time, status):
+        if status:
+            print("Audio status:", status)
+        audio_data.append(indata.copy())
+    
+    # Record audio
+    with sd.InputStream(samplerate=sample_rate, channels=1, dtype='float32', callback=callback):
+        import time
+        time.sleep(duration)
+    
+    # Convert to numpy array
+    audio_np = np.concatenate(audio_data, axis=0).flatten()
+    
+    # Transcribe using Whisper with FP16 on Jetson for speed
+    import torch
+    use_fp16 = torch.cuda.is_available()
+    result = whisper_model.transcribe(audio_np, fp16=use_fp16, language='en')
+    transcribed_text = result["text"].strip()
+    
+    print(f"Whisper transcribed: {transcribed_text}")  # Debug output
+    return transcribed_text
 
-# FAQ matching
-def match_faq_local(query, embed_model, faqs):
-    """Match query against local FAQs using embeddings."""
-    qvec = embed_model.encode([query])
-    best_score = 0
-    best_answer = None
-    
-    for category, qa_list in faqs.items():
-        for qa in qa_list:
-            faq_vec = embed_model.encode([qa["question"]])
-            score = util.cos_sim(qvec, faq_vec).item()
-            if score > best_score and score > 0.7:
+# Local FAQ Fuzzy match
+def match_faq_local(user_input, embed_model, faqs, threshold=0.78):
+    best_match = None
+    best_score = 0.0
+    user_vec = embed_model.encode(user_input)
+    for cat, qalist in faqs.items():
+        for qa in qalist:
+            qvec = embed_model.encode(qa["question"])
+            score = util.cos_sim(user_vec, qvec).item()
+            if score > best_score:
                 best_score = score
-                best_answer = qa["answer"]
-    
-    return best_answer
+                best_match = qa
+    if best_score >= threshold:
+        return best_match["answer"]
+    return None
 
-# Admin pages (placeholder - keeping existing implementation)
+# Admin Page
 def admin_login_page():
-    st.title("Admin Login")
-    password = st.text_input("Password", type="password")
-    if st.button("Login"):
-        if password == "admin123":
+    st.subheader("Admin Login")
+    username = st.text_input("Username", key="admin_user")
+    password = st.text_input("Password", type="password", key="admin_pass")
+
+    col1, col2 = st.columns([1,1])
+    with col1:
+        login_clicked = st.button("Login")
+    with col2:
+        if st.button("Cancel"):
+            st.session_state["page"] = "Chatbot"
+            st.rerun()
+
+    if login_clicked:
+        if username == "admin" and password == "password":
             st.session_state["admin_logged_in"] = True
             st.session_state["page"] = "Admin Dashboard"
+            st.success("Login successful! Redirecting to dashboard...")
             st.rerun()
         else:
-            st.error("Invalid password")
-
+            st.error("Invalid credentials")
+            
 def admin_dashboard_page(faqs):
-    if not st.session_state.get("admin_logged_in"):
-        st.error("Please login first")
-        return
-    
-    st.title("Admin Dashboard")
-    st.write("Manage FAQs")
-    
-    category = st.text_input("Category")
-    question = st.text_input("Question")
-    answer = st.text_area("Answer")
-    
-    if st.button("Add FAQ"):
-        if category and question and answer:
-            if category not in faqs:
-                faqs[category] = []
-            faqs[category].append({"question": question, "answer": answer})
-            save_faqs(faqs)
-            st.success("FAQ added")
-            st.rerun()
+    if not st.session_state.get("admin_logged_in", False):
+        st.warning("You must log in as admin to view this page.")
+        st.session_state["page"] = "Admin Login"
+        st.rerun()
 
-# Session state initialization
+    st.title("Admin Dashboard")
+    st.markdown("Use the dashboard to inspect logs, inventory and edit FAQs.")
+
+    col1, col2, col3 = st.columns([1,2,2])
+    with col1:
+        if st.button("Logout"):
+            st.session_state["admin_logged_in"] = False
+            st.session_state["page"] = "Chatbot"
+            st.success("Logged out.")
+            st.rerun()
+    with col2:
+        st.metric("FAQ categories", len(faqs.keys()))
+    with col3:
+        count = 0
+        if os.path.exists(INAPPROPRIATE_LOG):
+            with open(INAPPROPRIATE_LOG, "r", encoding="utf-8") as f:
+                count = sum(1 for _ in f)
+        st.metric("Inappropriate queries", count)
+
+    st.markdown("---")
+    st.subheader("Inappropriate Queries")
+    if os.path.exists(INAPPROPRIATE_LOG):
+        with open(INAPPROPRIATE_LOG, "r", encoding="utf-8") as f:
+            lines = [l.strip() for l in f.readlines() if l.strip()]
+        if lines:
+            st.dataframe({"timestamped_query": lines})
+            if st.button("Clear log"):
+                open(INAPPROPRIATE_LOG, "w", encoding="utf-8").close()
+                st.success("Log cleared.")
+                st.rerun()
+        else:
+            st.info("No inappropriate queries logged.")
+    else:
+        st.info("No log file found.")
+
+    st.markdown("---")
+    st.subheader("Component Stock (dummy)")
+    stock = {
+        "1kΩ Resistors": "High",
+        "2kΩ Resistors": "Low",
+        "10kΩ Resistors": "Medium",
+        "Capacitors (0.1 µF)": "High"
+    }
+    st.table({"Component": list(stock.keys()), "Stock Level": list(stock.values())})
+
+    st.markdown("---")
+    st.subheader("FAQ Editor (Add / Edit / Delete)")
+    categories = list(faqs.keys())
+    edit_mode = st.radio("Mode:", ["Add FAQ", "Edit FAQ", "Delete FAQ"])
+
+    st.markdown("---")
+    st.subheader("Redirect to Database")
+    
+    if st.button("Open Component Database"):
+        try:
+            subprocess.Popen([sys.executable,"dummy_db.py"])
+            time.sleep(1)
+            webbrowser.open("http://localhost:5001")
+            st.success("Database opened in new tab.")
+        except Exception as e:
+            st.error(f"Failed to launch:{e}")
+
+    
+    if edit_mode == "Add FAQ":
+        new_cat = st.text_input("Category (e.g. 'ECEN 214')", key="new_cat")
+        new_q = st.text_input("Question", key="new_q")
+        new_a = st.text_area("Answer", key="new_a")
+        if st.button("Add FAQ"):
+            if not new_cat or not new_q or not new_a:
+                st.error("Fill category, question and answer.")
+            else:
+                if new_cat not in faqs:
+                    faqs[new_cat] = []
+                faqs[new_cat].append({"question": new_q, "answer": new_a})
+                save_faqs(faqs)
+                st.success("FAQ added.")
+                st.rerun()
+
+    elif edit_mode == "Edit FAQ":
+        if not categories:
+            st.info("No categories available.")
+        else:
+            sel_cat = st.selectbox("Select category", categories, key="edit_cat")
+            q_list = faqs.get(sel_cat, [])
+            if q_list:
+                q_titles = [q["question"] for q in q_list]
+                sel_q_idx = st.selectbox("Select question to edit", list(range(len(q_titles))), format_func=lambda i: q_titles[i], key="edit_qidx")
+                sel_q = q_list[sel_q_idx]
+                edited_q = st.text_input("Question", value=sel_q["question"], key="edited_q")
+                edited_a = st.text_area("Answer", value=sel_q["answer"], key="edited_a")
+                if st.button("Save changes"):
+                    faqs[sel_cat][sel_q_idx] = {"question": edited_q, "answer": edited_a}
+                    save_faqs(faqs)
+                    st.success("FAQ updated.")
+                    st.rerun()
+            else:
+                st.info("No questions in this category.")
+
+    elif edit_mode == "Delete FAQ":
+        if not categories:
+            st.info("No categories available.")
+        else:
+            sel_cat = st.selectbox("Select category", categories, key="del_cat")
+            q_list = faqs.get(sel_cat, [])
+            if q_list:
+                q_titles = [q["question"] for q in q_list]
+                sel_q_idx = st.selectbox("Select question to delete", list(range(len(q_titles))), format_func=lambda i: q_titles[i], key="del_qidx")
+                if st.button("Delete selected FAQ"):
+                    faqs[sel_cat].pop(sel_q_idx)
+                    if not faqs[sel_cat]:
+                        del faqs[sel_cat]
+                    save_faqs(faqs)
+                    st.success("FAQ deleted.")
+                    st.rerun()
+            else:
+                st.info("No questions to delete in this category.")
+
+# UI Page
 st.session_state.setdefault("dispense_state", "IDLE")
 st.session_state.setdefault("selected_component", None)
 st.session_state.setdefault("selected_quantity", 1)
-st.session_state.setdefault("uart_status", None)
+# TESTING LLM CLASSIFICATION
+import re
 
-# LLM CLASSIFICATION FOR COMPONENT REQUESTS
-def extract_resistor_request(user_input):
+def extract_resistor_request(text):
     """
-    Uses LLM to parse user input and detect component request
-    Returns component identifier that maps to bin number
-    
-    Bin Mapping:
-    0 -> 1kΩ Resistor
-    1 -> 10kΩ Resistor
-    2 -> 100Ω Resistor
-    3 -> 100kΩ Resistor
+    Extract resistor request and return canonical component key
+    that matches uart_client.py COMPONENT_TO_BIN.
     """
+    text = text.lower().replace(" ", "")
 
-    prompt = f"""
-You are a lab assistant. Analyze this query:
-"{user_input}"
+    # Exact canonical matches first
+    if "1kohm" in text or "1k" in text or "1000ohm" in text:
+        return "1kohm"
 
-Determine if the user is asking for a resistor component.
-Match the request to one of these exact values:
-- 1kΩ (1k ohm, 1 kilo ohm, 1kohm, 1000 ohm)
-- 10kΩ (10k ohm, 10 kilo ohm, 10kohm, 10000 ohm)
-- 100Ω (100 ohm, hundred ohm)
-- 100kΩ (100k ohm, 100 kilo ohm, 100kohm)
+    if "10kohm" in text or "10k" in text or "10000ohm" in text:
+        return "10kohm"
 
-Respond with ONLY ONE of these exact strings:
-"1kohm"
-"10kohm"
-"100ohm"
-"100kohm"
-"none"
+    # Add more ONLY if uart_client supports them
+    # if "100ohm" in text:
+    #     return "100ohm"
 
-If the user is not requesting a resistor, respond with "none".
-"""
+    return None
 
-    try:
-        llm_response = query_tamuai(prompt).strip().lower()
-        llm_response = (
-        llm_response
-        .replace("ω", "")
-        .replace(" ", "")
-        .replace('"', '')
-        .replace("resistor", "")
-        )
-
-
-        # Map LLM response to component identifier
-        valid_responses = ["1kohm", "10kohm", "100ohm", "100kohm"]
-        
-        if llm_response in valid_responses:
-            print(f"[LLM CLASSIFICATION] Detected: {llm_response}")
-            return llm_response
-        else:
-            print(f"[LLM CLASSIFICATION] No component detected: {llm_response}")
-            return None
-
-    except Exception as e:
-        print(f"[LLM ERROR] Classification failed: {e}")
-        return None
 
 def chatbot_page(index, texts, embed_model, faqs):
     st.title("ECEN Chatbot")
@@ -314,6 +468,7 @@ def chatbot_page(index, texts, embed_model, faqs):
                     if st.button(qa["question"], key=f"faq_{qa['question']}"):
                         st.session_state["prefilled_question"] = qa["question"]
                         st.session_state["prefilled_answer"] = qa["answer"]
+                        # Don't rerun here - let the page render naturally
 
     # Initialize STT result storage
     if "stt_result" not in st.session_state:
@@ -330,6 +485,7 @@ def chatbot_page(index, texts, embed_model, faqs):
                     transcribed = transcribe_with_whisper(duration=5)
                     if transcribed:
                         st.session_state["stt_result"] = transcribed
+                        # Clear any prefilled FAQ data
                         st.session_state.pop("prefilled_question", None)
                         st.session_state.pop("prefilled_answer", None)
                         st.success(f"You said: {transcribed}")
@@ -340,23 +496,67 @@ def chatbot_page(index, texts, embed_model, faqs):
                     st.error(f"STT error: {e}")
 
     with col1:
+        # Use STT result if available, otherwise use default
         current_input = st.session_state.get("stt_result", default_q)
         user_input = st.text_input("Type your question here:", value=current_input, key="user_input")
 
-    # Component Dispenser Section
-    st.subheader("Component Dispenser")
-    
-    # Display UART status if available
-    if st.session_state.get("uart_status"):
-        status = st.session_state["uart_status"]
-        if status["success"]:
-            st.success(f"✓ Component dispensed from Bin {status['bin']}")
-        else:
-            st.error(f"✗ Dispense failed: {status.get('error', 'Unknown error')}")
-        
-        if st.button("Clear Status"):
-            st.session_state["uart_status"] = None
+    camera, component = st.columns(2)
+    if camera.button("Camera Vision", width="stretch"):
+        camera.markdown("You asked for camera vision.")
+    with component:
+        st.subheader("Component Dispenser")
+
+        components = {
+            "1kΩ Resistor": "1k_resistor",
+            "10kΩ Resistor": "10k_resistor",
+            "0.1µF Capacitor": "cap_100nf",
+            "Red LED": "led_red"
+        }
+
+        selected = st.selectbox(
+            "Component",
+            ["Select…"] + list(components.keys())
+        )
+
+        qty = st.number_input("Quantity", min_value=1, max_value=10, value=1)
+
+        if st.button("Review Request") and selected != "Select…":
+            st.session_state["selected_component"] = components[selected]
+            st.session_state["selected_quantity"] = qty
+            st.session_state["dispense_state"] = "CONFIRM"
             st.rerun()
+    if st.session_state["dispense_state"] == "CONFIRM":
+        st.warning("Confirm Component Request")
+
+        st.write(f"Component: **{selected}**")
+        st.write(f"Quantity: **{st.session_state['selected_quantity']}**")
+
+        col_a, col_b = st.columns(2)
+        with col_a:
+            if st.button("Confirm"):
+                st.session_state["dispense_state"] = "PROCESSING"
+                st.rerun()
+
+        with col_b:
+            if st.button("Cancel"):
+                st.session_state["dispense_state"] = "IDLE"
+                st.rerun()
+    if st.session_state["dispense_state"] == "PROCESSING":
+        with st.spinner("Processing request…"):
+            time.sleep(1.5)
+
+        st.session_state["dispense_state"] = "SUCCESS"
+        st.rerun()
+
+    if st.session_state["dispense_state"] == "SUCCESS":
+        st.success("Component request completed successfully.")
+
+        if st.button("Request another component"):
+            st.session_state["dispense_state"] = "IDLE"
+            st.session_state["selected_component"] = None
+            st.rerun()
+
+
 
     # Auto-display prefilled FAQ answer
     if "prefilled_answer" in st.session_state and default_q and not st.session_state.get("stt_result"):
@@ -375,37 +575,25 @@ def chatbot_page(index, texts, embed_model, faqs):
         return
 
     if user_input:
-        # LLM CLASSIFICATION TEST
+        #TEST LLM CLASSIFICATION
         resistor_request = extract_resistor_request(user_input)
 
         if resistor_request:
-            print(f"[LLM-INTEGRATION-TEST] Detected component request: {resistor_request}")
-            
-            # Show processing message
-            with st.spinner(f"Dispensing {resistor_request}..."):
-                try:
-                    # Send to ESP32 via UART
-                    success = send_component_request(resistor_request)
-                    
-                    # Map component to bin number for display
-                    bin_map = {"1kohm": 0, "10kohm": 1, "100ohm": 2, "100kohm": 3}
-                    bin_num = bin_map.get(resistor_request, -1)
-                    
-                    st.session_state["uart_status"] = {
-                        "success": success,
-                        "component": resistor_request,
-                        "bin": bin_num,
-                        "error": None if success else "No HIGH response from ESP32"
-                    }
-                    st.rerun()
-                    
-                except Exception as e:
-                    print(f"[UART ERROR] {e}")
-                    st.session_state["uart_status"] = {
-                        "success": False,
-                        "error": str(e)
-                    }
-                    st.rerun()
+            print("component dispensing requested")
+
+            with st.spinner("Dispensing component…"):
+                success = send_component_request(resistor_request)
+
+            if success:
+                st.success("You may now grab your component from the dispenser.")
+            else:
+                st.error("Component dispensing failed or timed out.")
+
+            return  # IMPORTANT: stop LLM / FAQ processing
+
+
+        
+
 
         # Clear STT result now that we're processing
         if "stt_result" in st.session_state:
