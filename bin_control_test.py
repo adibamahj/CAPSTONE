@@ -22,12 +22,17 @@ BEAM_ARM_DELAY = 2  # seconds
 # UTILITY FUNCTIONS
 # ============================================================
 
-def emergency_stop():
+def toggle_estop():
     global estop
-    estop = True
-    print("\nE-STOP ACTIVATED.")
-    print("Motor disabled. Restart program to reset.")
-    sys.exit(0)
+    
+    estop = not estop
+    
+    if estop:
+        print("\n=== E-STOP ACTIVATED ===")
+        print("Motion and inventory disabled.")
+    else:
+        print("\n=== E-STOP CLEARED ===")
+        print("System ready.")
 
 
 def quit_program():
@@ -37,6 +42,11 @@ def quit_program():
 
 def home():
     global homed, current_bin, last_selected_bin
+    
+    if estop:
+        print("E-STOP active. Clear it before homing.")
+        return
+    
     print("\n=== HOMING ROUTINE ===")
     time.sleep(1)
     homed = True
@@ -47,6 +57,10 @@ def home():
 
 def move_to_bin(target):
     global current_bin, last_selected_bin
+    
+    if estop:
+        print("E-STOP active. Motion disabled.")
+        return
     
     if not homed:
         print("ERROR: Not homed.")
@@ -77,10 +91,6 @@ def move_to_bin(target):
 
 
 def simulate_gate_block():
-    """
-    Simulates bin being pulled out.
-    In real system, this would come from break-beam.
-    """
     global gate_blocked, gate_lockout
     
     gate_blocked = True
@@ -91,6 +101,10 @@ def simulate_gate_block():
 
 def simulate_gate_reinsert():
     global gate_blocked, gate_lockout, inventory_pending
+    
+    if estop:
+        print("E-STOP active. Operation blocked.")
+        return
     
     if not gate_blocked:
         print("Gate already open.")
@@ -109,6 +123,10 @@ def simulate_gate_reinsert():
 def run_inventory():
     global inventory_pending
     
+    if estop:
+        print("E-STOP active. Inventory disabled.")
+        return
+    
     if not inventory_pending:
         print("Nothing to inventory.")
         return
@@ -120,7 +138,6 @@ def run_inventory():
     print("Measuring distance (simulated)...")
     time.sleep(2)
     
-    # Simulated depth reading
     simulated_distance = 10.5
     
     if simulated_distance < 12.0:
@@ -140,6 +157,7 @@ def print_status():
     print(f"Current Bin: {current_bin}")
     print(f"Gate Blocked: {gate_blocked}")
     print(f"Inventory Pending: {inventory_pending}")
+    print(f"E-STOP Active: {estop}")
     print("----------------\n")
 
 
@@ -155,14 +173,14 @@ while not homed:
     
     if cmd == "h":
         home()
+    elif cmd == "e":
+        toggle_estop()
     elif cmd == "q":
         quit_program()
-    elif cmd == "e":
-        emergency_stop()
     else:
-        print("Type 'h' to home or 'q' to quit.")
+        print("Type 'h' to home, 'e' to toggle E-STOP, or 'q' to quit.")
 
-print("\nCommands: h, bin0, bin1, bin2, bin3, i, push, status, e, q\n")
+print("\nCommands: h, bin0-3, i, push, status, e (toggle), q\n")
 
 
 # ============================================================
@@ -176,7 +194,7 @@ while True:
         quit_program()
     
     elif cmd == "e":
-        emergency_stop()
+        toggle_estop()
     
     elif cmd == "h":
         home()
