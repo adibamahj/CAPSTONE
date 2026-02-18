@@ -1,5 +1,18 @@
 import sys
 import time
+import serial
+from datetime import datetime
+
+# ============================================================
+# CONFIGURATION
+# ============================================================
+
+SERIAL_PORT = "/dev/ttyUSB0"       
+BAUD_RATE = 115200
+LOG_FILE = "inventory_log.txt"
+
+BEAM_ARM_DELAY = 2  # seconds
+
 
 # ============================================================
 # STATE VARIABLES
@@ -15,29 +28,58 @@ inventory_pending = False
 
 estop = False
 
-BEAM_ARM_DELAY = 2  # seconds
+
+# ============================================================
+# SERIAL SETUP
+# ============================================================
+
+try:
+    ser = serial.Serial(SERIAL_PORT, BAUD_RATE, timeout=1)
+    time.sleep(2)  # allow ESP32 reset
+    print("Connected to ESP32.")
+except:
+    print("ERROR: Could not open serial port.")
+    sys.exit(1)
 
 
 # ============================================================
 # UTILITY FUNCTIONS
 # ============================================================
 
+def send_to_esp(cmd):
+    ser.write((cmd + "\n").encode())
+
+
+def log_inventory(result):
+    timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    entry = f"{timestamp} | BIN{last_selected_bin} | {result}\n"
+    
+    with open(LOG_FILE, "a") as f:
+        f.write(entry)
+    
+    print(f"Logged: {entry.strip()}")
+
+
 def emergency_stop():
     global estop
     estop = True
+    send_to_esp("e")
     print("\nE-STOP ACTIVATED.")
-    print("Motor disabled. Restart program to reset.")
     sys.exit(0)
 
 
 def home():
     global homed, current_bin, last_selected_bin
-    print("\n=== HOMING ROUTINE ===")
-    time.sleep(1)
+    
+    send_to_esp("h")
+    print("Homing...")
+    
+    wait_for_serial_message("Homing complete")
+    
     homed = True
     current_bin = 0
     last_selected_bin = 0
-    print("Homing complete. Now at BIN0.")
+    print("Now at BIN0.")
 
 
 def move_to_bin(target):
@@ -52,53 +94,15 @@ def move_to_bin(target):
         return
     
     if gate_lockout:
-        print("GATE LOCKOUT: Bin removed or waiting 2s after reinsertion.")
+        print("GATE LOCKOUT active.")
         return
     
-    steps = (target - current_bin) % 4
-    
-    if steps == 0:
-        print(f"Already at BIN{target}")
-        return
-    
-    print(f"Moving CCW {steps} bin(s) to BIN{target}...")
-    time.sleep(1)
+    cmd = f"bin{target}"
+    send_to_esp(cmd)
     
     current_bin = target
     last_selected_bin = target
-    print(f"Now at BIN{current_bin}")
-    
-    simulate_gate_block()
-
-
-def simulate_gate_block():
-    """
-    Simulates bin being pulled out.
-    In real system, this would come from break-beam.
-    """
-    global gate_blocked, gate_lockout
-    
-    gate_blocked = True
-    gate_lockout = True
-    print("GATE: BLOCKED (bin pulled out).")
-    print("Type 'push' to simulate reinserting bin.")
-
-
-def simulate_gate_reinsert():
-    global gate_blocked, gate_lockout, inventory_pending
-    
-    if not gate_blocked:
-        print("Gate already open.")
-        return
-    
-    print("GATE: OPEN. Waiting 2 seconds...")
-    time.sleep(BEAM_ARM_DELAY)
-    
-    gate_blocked = False
-    gate_lockout = False
-    inventory_pending = True
-    
-    print("GATE READY. Press 'i' to perform inventory sensing.")
+    print(f"Selecting BIN{target}...")
 
 
 def run_inventory():
@@ -108,34 +112,47 @@ def run_inventory():
         print("Nothing to inventory.")
         return
     
-    print("\n=== INVENTORY SENSING ===")
-    print("Rotating 2 bins (180°)...")
-    time.sleep(1)
+    send_to_esp("i")
+    print("Waiting for HI/LO from ESP32...")
     
-    print("Measuring distance (simulated)...")
-    time.sleep(2)
+    result = wait_for_hi_lo()
     
-    # Simulated depth reading
-    simulated_distance = 10.5
-    
-    if simulated_distance < 12.0:
-        print("HI")
+    if result:
+        log_inventory(result)
+        inventory_pending = False
     else:
-        print("LO")
-    
-    print(f"(Distance = {simulated_distance} cm)")
-    
-    inventory_pending = False
-    print("Inventory complete. You may select another bin.")
+        print("No valid inventory result received.")
 
 
-def print_status():
-    print("\n--- STATUS ---")
-    print(f"Homed: {homed}")
-    print(f"Current Bin: {current_bin}")
-    print(f"Gate Blocked: {gate_blocked}")
-    print(f"Inventory Pending: {inventory_pending}")
-    print("----------------\n")
+def wait_for_hi_lo():
+    """
+    Waits until ESP32 sends HI or LO.
+    """
+    while True:
+        if ser.in_waiting > 0:
+            line = ser.readline().decode().strip()
+            
+            if line == "HI" or line == "LO":
+                print(f"ESP32: {line}")
+                return line
+            
+            # Optional: detect gate ready message
+            if "Ready" in line:
+                global inventory_pending
+                inventory_pending = True
+                print("Inventory now required.")
+
+
+def wait_for_serial_message(keyword):
+    """
+    Waits until a serial line contains a keyword.
+    """
+    while True:
+        if ser.in_waiting > 0:
+            line = ser.readline().decode().strip()
+            print("ESP32:", line)
+            if keyword in line:
+                return
 
 
 # ============================================================
@@ -155,8 +172,8 @@ while not homed:
     else:
         print("Please type 'h' to home.")
 
-print("\nCommands: h, bin0, bin1, bin2, bin3, i, e")
-print("Additional simulation command: push (reinsert bin)\n")
+
+print("\nCommands: h, bin0-3, i, e\n")
 
 
 # ============================================================
@@ -176,14 +193,8 @@ while True:
         target = int(cmd[-1])
         move_to_bin(target)
     
-    elif cmd == "push":
-        simulate_gate_reinsert()
-    
     elif cmd == "i":
         run_inventory()
     
-    elif cmd == "status":
-        print_status()
-    
     else:
-        print("Unknown command. Use h, bin0-3, i, e.")
+        print("Unknown command.")
