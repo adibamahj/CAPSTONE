@@ -8,6 +8,7 @@ import csv
 import subprocess
 import sys
 import webbrowser
+import atexit
 
 import numpy as np
 import serial
@@ -154,6 +155,46 @@ def _parse_line_into_state(line: str, state: dict):
             state["last_inv_distance"] = line.strip("()").split("=")[-1].strip()
         except Exception:
             state["last_inv_distance"] = "N/A"
+
+
+def _emergency_stop():
+    """
+    Send 'e' exactly once to the ESP32 over a fresh serial connection.
+    Used by the UI e-stop button. Does NOT loop — one send is intentional.
+    """
+    ser = _open_serial()
+    if ser is None:
+        print("[ESTOP] Could not open serial port for e-stop.")
+        return
+    try:
+        _send(ser, "e")
+        print("[ESTOP] E-stop sent.")
+    finally:
+        ser.close()
+
+
+def _on_exit():
+    """
+    Registered with atexit — runs automatically when the program exits
+    (including Ctrl+C). Sends 'quit' 20 times so the ESP32 is guaranteed
+    to receive it even if the first few are missed.
+    """
+    print("[EXIT] Sending quit signal to ESP32...")
+    ser = _open_serial()
+    if ser is None:
+        print("[EXIT] Could not open serial port for quit signal.")
+        return
+    try:
+        for _ in range(20):
+            _send(ser, "quit")
+            time.sleep(0.01)
+        print("[EXIT] Quit signal sent.")
+    finally:
+        ser.close()
+
+
+# Register the exit handler once at module load time
+atexit.register(_on_exit)
 
 
 def _log_inventory(result: str, distance: str, bin_num: int):
@@ -461,6 +502,7 @@ def render_dispenser_banner():
                       "dispense_inventory", "dispense_component_key"]:
                 st.session_state.pop(k, None)
             st.rerun()
+        return  # No e-stop needed after success
 
     elif ds == "ERROR":
         st.error(f"❌ {st.session_state.get('dispense_result_msg', 'An error occurred.')}")
@@ -468,6 +510,20 @@ def render_dispenser_banner():
             for k in ["dispense_state", "dispense_status_msg", "dispense_result_msg"]:
                 st.session_state.pop(k, None)
             st.rerun()
+        return  # No e-stop needed after error
+
+    # ── E-stop button — only shown during active dispensing states ──────────
+    # Shown for PROCESSING and WAITING_RETURN only (not SUCCESS or ERROR)
+    st.markdown("---")
+    if st.button("🛑 EMERGENCY STOP", key="estop_btn", type="primary"):
+        _emergency_stop()
+        # Reset dispense state so UI returns to IDLE
+        for k in ["dispense_state", "dispense_status_msg", "dispense_result_msg",
+                  "dispense_inventory", "dispense_component_key"]:
+            st.session_state.pop(k, None)
+        st.session_state["dispense_state"] = "ERROR"
+        st.session_state["dispense_result_msg"] = "Emergency stop triggered by user."
+        st.rerun()
 
 
 def _dispense_thread_worker(component_key: str):
