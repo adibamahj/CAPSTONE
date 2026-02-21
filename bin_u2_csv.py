@@ -252,7 +252,7 @@ def main():
 
             if user_input == "quit":
                 for i in range(20)
-                  send_command(ser,"q")
+                  send_command(ser,"q"):
                 print("Exiting.")
                 break
 
