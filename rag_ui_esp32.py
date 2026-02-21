@@ -202,9 +202,11 @@ def _signal_handler(sig, frame):
     sys.exit(0)
 
 
-# Register signal handler for Ctrl+C (SIGINT)
-signal.signal(signal.SIGINT, _signal_handler)
-# atexit as backup in case signal doesn't fire (e.g. SIGTERM)
+# signal.signal only works in the main thread.
+# Streamlit reruns the script in worker threads, so we guard against that.
+# atexit handles the worker thread case as a fallback.
+if threading.current_thread() is threading.main_thread():
+    signal.signal(signal.SIGINT, _signal_handler)
 atexit.register(_send_quit)
 
 
@@ -429,7 +431,7 @@ def query_tamuai(prompt):
         "stream": False,
         "messages": [{"role": "user", "content": prompt}],
     }
-    r = requests.post(f"{API_URL}/api/chat/completions", headers=headers, json=payload, timeout=30)
+    r = requests.post(f"{API_URL}/api/chat/completions", headers=headers, json=payload, timeout=60)
     r.raise_for_status()
     return r.json()["choices"][0]["message"]["content"]
 
