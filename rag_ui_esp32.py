@@ -138,12 +138,49 @@ def _get_last_inventory(bin_num: int) -> str | None:
     return last
 
 
+def _inventory_background(ser: serial.Serial, gate_lines: list, bin_num: int):
+    """
+    Sends 'i' and logs the inventory result silently in a background thread.
+    Called after the user has already taken their component — UI doesn't wait for this.
+    Closes the serial port when done.
+    """
+    try:
+        for _ in range(20):
+            _send(ser, "i")
+        _, inv_lines = _wait_for(ser, "Inventory complete", INV_TIMEOUT_S)
+
+        inv_result   = "UNKNOWN"
+        inv_distance = "N/A"
+        for line in gate_lines + inv_lines:
+            if line == "HI":
+                inv_result = "HI"
+            elif line == "LO":
+                inv_result = "LO"
+            elif line.startswith("(Distance(cm)"):
+                try:
+                    inv_distance = line.strip("()").split("=")[-1].strip()
+                except Exception:
+                    pass
+
+        _log_inventory(inv_result, inv_distance, bin_num)
+        print(f"[INV] bin{bin_num} → {inv_result} ({inv_distance} cm)")
+    finally:
+        ser.close()
+
+
 def dispense_component(component_key: str) -> dict:
     """
-    Runs the full dispense sequence synchronously.
-    Called directly inside st.spinner() — UI shows 'Dispensing...'
-    while this blocks, exactly like the LLM call does with 'Thinking...'.
-    No threads, no polling, no session state complexity.
+    Phase 1 (blocks inside st.spinner):
+      - Home carousel
+      - Move to bin
+      - Wait for user to pull bin, take component, reinsert bin (GATE: Ready)
+
+    Once GATE: Ready is received the user already has their component.
+    UI immediately clears and shows success.
+
+    Phase 2 (fire-and-forget background thread):
+      - Send 'i', wait for Inventory complete, log HI/LO to CSV.
+      - User never waits for this — it runs silently after the UI is already free.
     """
     bin_num      = COMPONENT_TO_BIN.get(component_key)
     display_name = COMPONENT_DISPLAY.get(component_key, component_key)
@@ -161,6 +198,7 @@ def dispense_component(component_key: str) -> dict:
             _send(ser, "h")
         ok, _ = _wait_for(ser, "Homing complete", HOME_TIMEOUT_S)
         if not ok:
+            ser.close()
             return {"success": False, "message": "Homing timed out.", "inventory": "UNKNOWN"}
 
         # Step 2: Move to bin
@@ -168,43 +206,34 @@ def dispense_component(component_key: str) -> dict:
             _send(ser, f"bin{bin_num}")
         ok, _ = _wait_for(ser, f"Done. Now at BIN{bin_num}", MOVE_TIMEOUT_S)
         if not ok:
+            ser.close()
             return {"success": False, "message": f"Failed to move to bin {bin_num}.", "inventory": "UNKNOWN"}
 
-        # Step 3: Wait for user to take component and reinsert bin
+        # Step 3: Wait for user to pull bin, take component, reinsert bin
         ok, gate_lines = _wait_for(ser, "GATE: Ready", GATE_TIMEOUT_S)
         if not ok:
+            ser.close()
             return {"success": False, "message": "Timed out waiting for bin to be reinserted.", "inventory": "UNKNOWN"}
 
-        # Step 4: Inventory sensing — "Inventory complete" is the final signal
-        for _ in range(20):
-            _send(ser, "i")
-        ok, inv_lines = _wait_for(ser, "Inventory complete", INV_TIMEOUT_S)
+        # User has their component — hand off to background thread for inventory sensing.
+        # Do NOT close ser here — the background thread owns it and will close it.
+        import threading
+        t = threading.Thread(
+            target=_inventory_background,
+            args=(ser, gate_lines, bin_num),
+            daemon=True
+        )
+        t.start()
 
-        # Parse HI/LO and distance from all received lines
-        inv_result   = "UNKNOWN"
-        inv_distance = "N/A"
-        for line in gate_lines + inv_lines:
-            if line == "HI":
-                inv_result = "HI"
-            elif line == "LO":
-                inv_result = "LO"
-            elif line.startswith("(Distance(cm)"):
-                try:
-                    inv_distance = line.strip("()").split("=")[-1].strip()
-                except Exception:
-                    pass
-
-        _log_inventory(inv_result, inv_distance, bin_num)
-
-        stock_note = "Stock still available." if inv_result == "HI" else "Stock low — please restock."
         return {
             "success": True,
-            "message": f"{display_name} dispensed successfully. {stock_note}",
-            "inventory": inv_result,
+            "message": f"{display_name} dispensed successfully.",
+            "inventory": "UNKNOWN",  # logged async — check CSV for result
         }
 
-    finally:
+    except Exception as e:
         ser.close()
+        return {"success": False, "message": f"Dispense error: {e}", "inventory": "UNKNOWN"}
 
 
 # ═══════════════════════════════════════════════════════════
@@ -552,20 +581,26 @@ def chatbot_page(index, texts, embed_model, faqs):
         with c1:
             if st.button("✅ Confirm"):
                 st.session_state.pop("pending_dispense")
-                # Dispense runs synchronously inside spinner — same as LLM "Thinking..."
                 with st.spinner(f"Dispensing {comp_name}... please wait."):
                     result = dispense_component(comp_key)
                 if result["success"]:
-                    st.success(f"✅ {result['message']}")
-                    if result["inventory"] == "LO":
-                        st.warning("⚠️ Stock is low — please ask a lab assistant to restock.")
+                    st.session_state["dispense_result"] = f"✅ {result['message']}"
                 else:
-                    st.error(f"❌ {result['message']}")
+                    st.session_state["dispense_result"] = f"❌ {result['message']}"
+                st.rerun()  # clears confirm page, shows result on clean page
         with c2:
             if st.button("❌ Cancel"):
                 st.session_state.pop("pending_dispense")
                 st.rerun()
         return
+
+    # ── Show dispense result if just completed ────────────────
+    if "dispense_result" in st.session_state:
+        msg = st.session_state.pop("dispense_result")
+        if msg.startswith("✅"):
+            st.success(msg)
+        else:
+            st.error(msg)
 
     # ── FAQ prefill display ───────────────────────────────────
     if "prefilled_answer" in st.session_state and not st.session_state.get("stt_result"):
