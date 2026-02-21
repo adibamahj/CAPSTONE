@@ -9,6 +9,7 @@ import subprocess
 import sys
 import webbrowser
 import atexit
+import signal
 
 import numpy as np
 import serial
@@ -60,11 +61,11 @@ COMPONENT_DISPLAY = {
 }
 
 # ── Dispense timeouts ─────────────────────────────────────────
-HOME_TIMEOUT_S     = 60    # max seconds to wait for homing complete
+HOME_TIMEOUT_S     = 30    # max seconds to wait for homing complete
 MOVE_TIMEOUT_S     = 30    # max seconds to wait for bin move complete
-GATE_TIMEOUT_S     = 120   # max seconds to wait for user to take component + reinsert bin
+GATE_TIMEOUT_S     = 30   # max seconds to wait for user to take component + reinsert bin
 INV_TIMEOUT_S      = 20    # max seconds to wait for inventory sensing complete
-DONE_TIMEOUT_S     = 20    # max seconds to wait for DONE DISPENSING after inventory
+DONE_TIMEOUT_S     = 10    # max seconds to wait for DONE DISPENSING after inventory
 
 
 # ═══════════════════════════════════════════════════════════
@@ -173,20 +174,14 @@ def _emergency_stop():
         ser.close()
 
 
-_exit_called = False  # Guard so atexit only fires once across all threads
+_exit_called = False  # Guard so quit only fires once
 
-def _on_exit():
-    """
-    Registered with atexit — runs automatically when the program exits
-    (including Ctrl+C). Sends 'quit' 20 times so the ESP32 is guaranteed
-    to receive it even if the first few are missed.
-    Guard flag prevents multiple Streamlit threads from each firing this.
-    """
+def _send_quit():
+    """Send 'quit' 20 times to the ESP32. Called on Ctrl+C."""
     global _exit_called
     if _exit_called:
         return
     _exit_called = True
-
     print("[EXIT] Sending quit signal to ESP32...")
     ser = _open_serial()
     if ser is None:
@@ -201,8 +196,16 @@ def _on_exit():
         ser.close()
 
 
-# Register the exit handler once at module load time
-atexit.register(_on_exit)
+def _signal_handler(sig, frame):
+    """Caught Ctrl+C — send quit to ESP32 then exit cleanly."""
+    _send_quit()
+    sys.exit(0)
+
+
+# Register signal handler for Ctrl+C (SIGINT)
+signal.signal(signal.SIGINT, _signal_handler)
+# atexit as backup in case signal doesn't fire (e.g. SIGTERM)
+atexit.register(_send_quit)
 
 
 def _log_inventory(result: str, distance: str, bin_num: int):
@@ -246,24 +249,6 @@ def dispense_component_blocking(component_key: str) -> dict:
         return {"success": False,
                 "message": f"'{display_name}' is not mapped to any bin.",
                 "inventory": "UNKNOWN"}
-
-    # Pre-check last known inventory from CSV.
-    # Only allow dispensing if the last recorded result is explicitly "HI".
-    # "LO", no record, or anything else → block and inform user.
-    last_inv = _get_last_inventory(bin_num)
-    if last_inv != "HI":
-        if last_inv == "LO":
-            reason = "last recorded as empty"
-        elif last_inv is None:
-            reason = "no inventory record found — bin has not been stocked or checked yet"
-        else:
-            reason = f"last recorded status was '{last_inv}'"
-        return {"success": False,
-                "message": (
-                    f"Cannot dispense {display_name} from bin {bin_num}: {reason}. "
-                    f"Please check back later or ask a lab assistant to restock."
-                ),
-                "inventory": last_inv or "UNKNOWN"}
 
     ser = _open_serial()
     if ser is None:
@@ -310,10 +295,12 @@ def dispense_component_blocking(component_key: str) -> dict:
                     "inventory": "UNKNOWN"}
 
         # ── Step 4: Trigger inventory sensing ─────────────────
+        # "Inventory complete. You may now select another bin." is the
+        # final signal — no separate DONE DISPENSING needed.
         st.session_state["dispense_status_msg"] = "Measuring remaining stock..."
         for _ in range(20):
             _send(ser, "i")
-        ok, inv_lines = _wait_for(ser, "Inventory complete", INV_TIMEOUT_S, local_state)
+        _, inv_lines = _wait_for(ser, "Inventory complete", INV_TIMEOUT_S, local_state)
 
         # Parse HI/LO from all lines received during steps 3+4
         for line in gate_lines + inv_lines:
@@ -323,13 +310,10 @@ def dispense_component_blocking(component_key: str) -> dict:
         inv_distance = local_state.get("last_inv_distance", "N/A")
         _log_inventory(inv_result, inv_distance, bin_num)
 
-        # ── Step 5: Wait for DONE DISPENSING ─────────────────
-        _wait_for(ser, "Inventory complete. You may now select another bin.", DONE_TIMEOUT_S, local_state)
-
         stock_note = "Stock still available." if inv_result == "HI" else "Stock low — please restock."
         return {
             "success": True,
-            "message": f"{display_name} dispensed from bin {bin_num}. {stock_note}",
+            "message": f"{display_name} dispensed successfully. {stock_note}",
             "inventory": inv_result,
         }
 
@@ -445,7 +429,7 @@ def query_tamuai(prompt):
         "stream": False,
         "messages": [{"role": "user", "content": prompt}],
     }
-    r = requests.post(f"{API_URL}/api/chat/completions", headers=headers, json=payload, timeout=60)
+    r = requests.post(f"{API_URL}/api/chat/completions", headers=headers, json=payload, timeout=30)
     r.raise_for_status()
     return r.json()["choices"][0]["message"]["content"]
 
@@ -712,24 +696,45 @@ def chatbot_page(index, texts, embed_model, faqs):
     render_dispenser_banner()
 
     # ── Polling loop while dispensing is active ───────────────
-    # Background thread can't trigger Streamlit reruns directly,
-    # so we poll every second until the thread updates dispense_state.
     ds = st.session_state.get("dispense_state", "IDLE")
     if ds in ("PROCESSING", "WAITING_RETURN"):
+        # Track when polling started so we can timeout if thread dies silently
+        poll_start = st.session_state.setdefault("poll_start_time", time.time())
+        elapsed = time.time() - poll_start
+
+        # Overall max: HOME + MOVE + GATE + INV timeouts combined + 30s buffer
+        max_poll = HOME_TIMEOUT_S + MOVE_TIMEOUT_S + GATE_TIMEOUT_S + INV_TIMEOUT_S + 30
+
+        if elapsed > max_poll:
+            # Thread took too long or died — force error state
+            st.session_state.pop("poll_start_time", None)
+            st.session_state["dispense_state"]      = "ERROR"
+            st.session_state["dispense_result_msg"] = (
+                "Dispensing timed out. Please check the ESP32 and try again."
+            )
+            st.rerun()
+            return
+
         time.sleep(1)
         st.rerun()
+        return
 
-    # ── Auto-dismiss SUCCESS after 10 seconds ─────────────────
+    # Clear poll timer when no longer dispensing
+    st.session_state.pop("poll_start_time", None)
+
+    # ── SUCCESS — show inline message, stay on same page ─────
     if ds == "SUCCESS":
-        countdown = st.empty()
-        for i in range(20, 0, -1):
-            countdown.info(f"Returning to main page in {i} seconds...")
-            time.sleep(1)
-        countdown.empty()
-        for k in ["dispense_state", "dispense_status_msg", "dispense_result_msg",
-                  "dispense_inventory", "dispense_component_key"]:
-            st.session_state.pop(k, None)
-        st.rerun()
+        msg = st.session_state.get("dispense_result_msg", "Dispensing complete.")
+        inv = st.session_state.get("dispense_inventory", "")
+        st.success(f"✅ {msg}")
+        if inv == "LO":
+            st.warning("⚠️ Stock is low — please ask a lab assistant to restock.")
+        if st.button("✔ Done — request another component", key="done_btn"):
+            for k in ["dispense_state", "dispense_status_msg", "dispense_result_msg",
+                      "dispense_inventory", "dispense_component_key"]:
+                st.session_state.pop(k, None)
+            st.rerun()
+        return
 
     # ── Sidebar FAQs ─────────────────────────────────────────
     with st.sidebar:
@@ -776,23 +781,12 @@ def chatbot_page(index, texts, embed_model, faqs):
             comp_name     = COMPONENT_DISPLAY.get(component_key, component_key)
             last_inv      = _get_last_inventory(bin_num)
 
-            if last_inv != "HI":
-                if last_inv == "LO":
-                    st.error(
-                        f"**{comp_name}** is currently out of stock. "
-                        f"Please check back later or ask a lab assistant to restock bin {bin_num}."
-                    )
-                elif last_inv is None:
-                    st.error(
-                        f"**{comp_name}** has no inventory record on file. "
-                        f"Bin {bin_num} may not have been stocked yet. "
-                        f"Please ask a lab assistant to check the bin."
-                    )
-                else:
-                    st.error(
-                        f"**{comp_name}** stock status is unclear (status: {last_inv}). "
-                        f"Please ask a lab assistant to check bin {bin_num}."
-                    )
+            # Block only if explicitly LO — None means no history, allow first use
+            if last_inv == "LO":
+                st.error(
+                    f"**{comp_name}** is currently out of stock. "
+                    f"Please check back later or ask a lab assistant to restock bin {bin_num}."
+                )
             else:
                 st.session_state["pending_dispense"] = component_key
 
@@ -842,24 +836,12 @@ def chatbot_page(index, texts, embed_model, faqs):
         bin_num   = COMPONENT_TO_BIN[component_key]
         last_inv  = _get_last_inventory(bin_num)
 
-        # Only allow if last recorded inventory is explicitly HI
-        if last_inv != "HI":
-            if last_inv == "LO":
-                st.error(
-                    f"**{comp_name}** is currently out of stock. "
-                    f"Please check back later or ask a lab assistant to restock bin {bin_num}."
-                )
-            elif last_inv is None:
-                st.error(
-                    f"**{comp_name}** has no inventory record on file. "
-                    f"Bin {bin_num} may not have been stocked yet. "
-                    f"Please ask a lab assistant to check the bin."
-                )
-            else:
-                st.error(
-                    f"**{comp_name}** stock status is unclear (status: {last_inv}). "
-                    f"Please ask a lab assistant to check bin {bin_num}."
-                )
+        # Block only if explicitly LO — None means no history, allow first use
+        if last_inv == "LO":
+            st.error(
+                f"**{comp_name}** is currently out of stock. "
+                f"Please check back later or ask a lab assistant to restock bin {bin_num}."
+            )
             return
 
         st.info(f"Component request detected: **{comp_name}** → bin {bin_num}")
