@@ -251,8 +251,8 @@ def main():
                 continue
 
             if user_input == "quit":
-                for i in range(20)
-                  send_command(ser,"q"):
+                for i in range(20):
+                  send_command(ser,"quit")
                 print("Exiting.")
                 break
 
@@ -274,7 +274,8 @@ def main():
                     confirm = input("[WARN] Gate appears blocked. Home anyway? (y/n): ").strip().lower()
                     if confirm != "y":
                         continue
-                send_command(ser, "h")
+                for i in range(20):
+                  send_command(ser,"h")
                 continue
 
             if user_input == "i":
@@ -283,7 +284,8 @@ def main():
                 elif state["gate_blocked"]:
                     print("[LOCAL] Gate is BLOCKED. Push bin fully in first.")
                 else:
-                    send_command(ser, "i")
+                    for i in range(20):
+                    	send_command(ser, "i")
                 continue
 
             if user_input in ("bin0", "bin1", "bin2", "bin3"):
@@ -294,7 +296,8 @@ def main():
                 elif not state["homed"]:
                     print("[LOCAL] Not homed. Send 'h' first.")
                 else:
-                    send_command(ser, user_input)
+                    for i in range(20):
+                    	send_command(ser, user_input)
                 continue
 
             print(f"[LOCAL] Unknown command '{user_input}'. Type 'help' for options.")
