@@ -64,7 +64,7 @@ HOME_TIMEOUT_S     = 60    # max seconds to wait for homing complete
 MOVE_TIMEOUT_S     = 30    # max seconds to wait for bin move complete
 GATE_TIMEOUT_S     = 120   # max seconds to wait for user to take component + reinsert bin
 INV_TIMEOUT_S      = 20    # max seconds to wait for inventory sensing complete
-DONE_TIMEOUT_S     = 10    # max seconds to wait for DONE DISPENSING after inventory
+DONE_TIMEOUT_S     = 20    # max seconds to wait for DONE DISPENSING after inventory
 
 
 # ═══════════════════════════════════════════════════════════
@@ -173,12 +173,20 @@ def _emergency_stop():
         ser.close()
 
 
+_exit_called = False  # Guard so atexit only fires once across all threads
+
 def _on_exit():
     """
     Registered with atexit — runs automatically when the program exits
     (including Ctrl+C). Sends 'quit' 20 times so the ESP32 is guaranteed
     to receive it even if the first few are missed.
+    Guard flag prevents multiple Streamlit threads from each firing this.
     """
+    global _exit_called
+    if _exit_called:
+        return
+    _exit_called = True
+
     print("[EXIT] Sending quit signal to ESP32...")
     ser = _open_serial()
     if ser is None:
@@ -239,12 +247,23 @@ def dispense_component_blocking(component_key: str) -> dict:
                 "message": f"'{display_name}' is not mapped to any bin.",
                 "inventory": "UNKNOWN"}
 
-    # Pre-check last known inventory
+    # Pre-check last known inventory from CSV.
+    # Only allow dispensing if the last recorded result is explicitly "HI".
+    # "LO", no record, or anything else → block and inform user.
     last_inv = _get_last_inventory(bin_num)
-    if last_inv == "LO":
+    if last_inv != "HI":
+        if last_inv == "LO":
+            reason = "last recorded as empty"
+        elif last_inv is None:
+            reason = "no inventory record found — bin has not been stocked or checked yet"
+        else:
+            reason = f"last recorded status was '{last_inv}'"
         return {"success": False,
-                "message": f"Bin {bin_num} ({display_name}) was last recorded empty. Please restock.",
-                "inventory": "LO"}
+                "message": (
+                    f"Cannot dispense {display_name} from bin {bin_num}: {reason}. "
+                    f"Please check back later or ask a lab assistant to restock."
+                ),
+                "inventory": last_inv or "UNKNOWN"}
 
     ser = _open_serial()
     if ser is None:
@@ -305,7 +324,7 @@ def dispense_component_blocking(component_key: str) -> dict:
         _log_inventory(inv_result, inv_distance, bin_num)
 
         # ── Step 5: Wait for DONE DISPENSING ─────────────────
-        _wait_for(ser, "DONE DISPENSING", DONE_TIMEOUT_S, local_state)
+        _wait_for(ser, "Inventory complete. You may now select another bin.", DONE_TIMEOUT_S, local_state)
 
         stock_note = "Stock still available." if inv_result == "HI" else "Stock low — please restock."
         return {
@@ -692,10 +711,25 @@ def chatbot_page(index, texts, embed_model, faqs):
     # Always render dispenser banner at top so status is visible
     render_dispenser_banner()
 
-    # If dispensing is in progress, show a live-updating spinner and block new input
+    # ── Polling loop while dispensing is active ───────────────
+    # Background thread can't trigger Streamlit reruns directly,
+    # so we poll every second until the thread updates dispense_state.
     ds = st.session_state.get("dispense_state", "IDLE")
     if ds in ("PROCESSING", "WAITING_RETURN"):
-        st.stop()  # Stop rendering the rest of the page until dispense resolves
+        time.sleep(1)
+        st.rerun()
+
+    # ── Auto-dismiss SUCCESS after 10 seconds ─────────────────
+    if ds == "SUCCESS":
+        countdown = st.empty()
+        for i in range(20, 0, -1):
+            countdown.info(f"Returning to main page in {i} seconds...")
+            time.sleep(1)
+        countdown.empty()
+        for k in ["dispense_state", "dispense_status_msg", "dispense_result_msg",
+                  "dispense_inventory", "dispense_component_key"]:
+            st.session_state.pop(k, None)
+        st.rerun()
 
     # ── Sidebar FAQs ─────────────────────────────────────────
     with st.sidebar:
@@ -738,7 +772,29 @@ def chatbot_page(index, texts, embed_model, faqs):
         qty = st.number_input("Quantity", min_value=1, max_value=10, value=1)
         if st.button("Request Component") and component_options[selected_display]:
             component_key = component_options[selected_display]
-            st.session_state["pending_dispense"] = component_key
+            bin_num       = COMPONENT_TO_BIN[component_key]
+            comp_name     = COMPONENT_DISPLAY.get(component_key, component_key)
+            last_inv      = _get_last_inventory(bin_num)
+
+            if last_inv != "HI":
+                if last_inv == "LO":
+                    st.error(
+                        f"**{comp_name}** is currently out of stock. "
+                        f"Please check back later or ask a lab assistant to restock bin {bin_num}."
+                    )
+                elif last_inv is None:
+                    st.error(
+                        f"**{comp_name}** has no inventory record on file. "
+                        f"Bin {bin_num} may not have been stocked yet. "
+                        f"Please ask a lab assistant to check the bin."
+                    )
+                else:
+                    st.error(
+                        f"**{comp_name}** stock status is unclear (status: {last_inv}). "
+                        f"Please ask a lab assistant to check bin {bin_num}."
+                    )
+            else:
+                st.session_state["pending_dispense"] = component_key
 
     # ── Confirm + kick off dispense from manual selector ─────
     if "pending_dispense" in st.session_state:
@@ -786,8 +842,24 @@ def chatbot_page(index, texts, embed_model, faqs):
         bin_num   = COMPONENT_TO_BIN[component_key]
         last_inv  = _get_last_inventory(bin_num)
 
-        if last_inv == "LO":
-            st.error(f"Sorry, **{comp_name}** (bin {bin_num}) is currently out of stock.")
+        # Only allow if last recorded inventory is explicitly HI
+        if last_inv != "HI":
+            if last_inv == "LO":
+                st.error(
+                    f"**{comp_name}** is currently out of stock. "
+                    f"Please check back later or ask a lab assistant to restock bin {bin_num}."
+                )
+            elif last_inv is None:
+                st.error(
+                    f"**{comp_name}** has no inventory record on file. "
+                    f"Bin {bin_num} may not have been stocked yet. "
+                    f"Please ask a lab assistant to check the bin."
+                )
+            else:
+                st.error(
+                    f"**{comp_name}** stock status is unclear (status: {last_inv}). "
+                    f"Please ask a lab assistant to check bin {bin_num}."
+                )
             return
 
         st.info(f"Component request detected: **{comp_name}** → bin {bin_num}")
