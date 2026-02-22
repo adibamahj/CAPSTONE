@@ -596,10 +596,17 @@ def chatbot_page(index, texts, embed_model, faqs):
                     st.session_state["dispense_result"] = f"✅ {result['message']}"
                 else:
                     st.session_state["dispense_result"] = f"❌ {result['message']}"
-                st.rerun()  # clears confirm page, shows result on clean page
+                # Clear input so the component keyword isn't re-detected on rerun
+                st.session_state["stt_result"] = ""
+                st.session_state.pop("prefilled_question", None)
+                st.session_state.pop("prefilled_answer", None)
+                st.rerun()
         with c2:
             if st.button("❌ Cancel"):
                 st.session_state.pop("pending_dispense")
+                # Clear input on cancel too so user starts fresh
+                st.session_state["stt_result"] = ""
+                st.session_state.pop("prefilled_question", None)
                 st.rerun()
         return
 
