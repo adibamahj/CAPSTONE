@@ -193,13 +193,18 @@ def dispense_component(component_key: str) -> dict:
         return {"success": False, "message": "Could not open serial port.", "inventory": "UNKNOWN"}
 
     try:
-        # Step 1: Home
-        for _ in range(20):
-            _send(ser, "h")
-        ok, _ = _wait_for(ser, "Homing complete", HOME_TIMEOUT_S)
-        if not ok:
-            ser.close()
-            return {"success": False, "message": "Homing timed out.", "inventory": "UNKNOWN"}
+        # Step 1: Home — only runs once per UI session
+        if not st.session_state.get("carousel_homed", False):
+            for _ in range(20):
+                _send(ser, "h")
+            ok, _ = _wait_for(ser, "Homing complete", HOME_TIMEOUT_S)
+            if not ok:
+                ser.close()
+                return {"success": False, "message": "Homing timed out.", "inventory": "UNKNOWN"}
+            st.session_state["carousel_homed"] = True
+            print("[HOME] Homing complete — will not home again this session.")
+        else:
+            print("[HOME] Already homed this session — skipping.")
 
         # Step 2: Move to bin
         for _ in range(20):
@@ -507,13 +512,17 @@ def admin_dashboard_page(faqs):
                 st.rerun()
 
     st.markdown("---")
-    if st.button("Open Component Database"):
+    if st.button("Open Database"):
+        import socket
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+            already_running = s.connect_ex(("localhost", 5000)) == 0
         try:
-            subprocess.Popen([sys.executable, "dummy_db.py"])
-            time.sleep(1)
-            webbrowser.open("http://localhost:5001")
+            if not already_running:
+                subprocess.Popen([sys.executable, "db.py"])
+                time.sleep(1)
+            webbrowser.open("http://localhost:5000")
         except Exception as e:
-            st.error(f"Failed: {e}")
+            st.error(f"Failed to launch database: {e}")
 
 
 # ═══════════════════════════════════════════════════════════
@@ -702,6 +711,26 @@ def main():
 
     st.session_state.setdefault("page", "Chatbot")
     st.session_state.setdefault("admin_logged_in", False)
+    st.session_state.setdefault("carousel_homed", False)
+
+    # Home the carousel once at startup if not already done
+    if not st.session_state["carousel_homed"]:
+        with st.spinner("Homing carousel on startup..."):
+            ser = _open_serial()
+            if ser:
+                try:
+                    for _ in range(20):
+                        _send(ser, "h")
+                    ok, _ = _wait_for(ser, "Homing complete", HOME_TIMEOUT_S)
+                    if ok:
+                        st.session_state["carousel_homed"] = True
+                        print("[HOME] Startup homing complete.")
+                    else:
+                        st.warning("Carousel homing timed out at startup. Will retry on first dispense.")
+                finally:
+                    ser.close()
+            else:
+                st.warning("Could not open serial port for startup homing. Will retry on first dispense.")
 
     embed_model = None
     try:
